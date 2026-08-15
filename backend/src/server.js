@@ -1,3 +1,10 @@
+if (typeof global.DOMMatrix === 'undefined') {
+  global.DOMMatrix = class DOMMatrix {};
+}
+if (typeof global.Path2D === 'undefined') {
+  global.Path2D = class Path2D {};
+}
+
 const path = require("path");
 
 require("dotenv").config({ path: path.resolve(__dirname, "../.env"), quiet: true });
