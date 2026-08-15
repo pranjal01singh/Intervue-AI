@@ -1,4 +1,4 @@
-const { PDFParse } = require("pdf-parse")
+const pdfParse = require("pdf-parse")
 
 const SECTION_ALIASES = {
   skills: ["skills", "technical skills", "core skills", "key skills", "technologies", "tools", "tech stack"],
@@ -88,7 +88,7 @@ const splitIntoSections = (text) => {
     if (sectionKey) {
       currentKey = sectionKey
       sections[currentKey] = sections[currentKey] || []
-      const remainder = line.replace(new RegExp(`^(${SECTION_ALIASES[sectionKey].join("|")})[:\\s-]*`, "i"), "").trim()
+      const remainder = line.replace(new RegExp(`^(${SECTION_ALIASES[sectionKey].join("|")})[:\\\\s-]*`, "i"), "").trim()
       if (remainder) sections[currentKey].push(remainder)
       return
     }
@@ -151,23 +151,17 @@ const extractImportantDetails = (sections) => ({
 })
 
 const parseResumePdf = async (buffer) => {
-  const parser = new PDFParse({ data: buffer })
+  const result = await pdfParse(buffer)
+  const text = cleanText(result.text || "")
+  const sections = splitIntoSections(text)
 
-  try {
-    const result = await parser.getText()
-    const text = cleanText(result.text || "")
-    const sections = splitIntoSections(text)
-
-    return {
-      rawText: text,
-      skills: extractSkills(text, sections),
-      projects: extractEntries(sections.projects, 10),
-      contact: extractContactInfo(text),
-      importantDetails: extractImportantDetails(sections),
-      parsedAt: new Date(),
-    }
-  } finally {
-    await parser.destroy()
+  return {
+    rawText: text,
+    skills: extractSkills(text, sections),
+    projects: extractEntries(sections.projects, 10),
+    contact: extractContactInfo(text),
+    importantDetails: extractImportantDetails(sections),
+    parsedAt: new Date(),
   }
 }
 
