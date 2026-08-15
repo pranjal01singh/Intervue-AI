@@ -13,7 +13,8 @@ app.use(
   })
 );
 app.use(express.json());
-app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
+const uploadPath = process.env.VERCEL ? "/tmp/uploads" : path.join(__dirname, "../uploads");
+app.use("/uploads", express.static(uploadPath));
 
 app.get("/api/health", (req, res) => {
   res.status(200).json({ success: true, message: "API is running" });

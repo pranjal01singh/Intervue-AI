@@ -6,7 +6,7 @@ const parseResumePdf = require("../utils/resumeParser")
 const { generateInterviewPlan, generateFollowUpQuestion, evaluateInterview, pairQuestionAnswers, summarizeLiveMetrics } = require("../services/aiInterviewService")
 const { createResumeEmbeddings, findRelevantResumeChunks } = require("../services/resumeEmbeddingService")
 
-const uploadDir = path.resolve(__dirname, "../../uploads/resumes")
+const uploadDir = process.env.VERCEL ? "/tmp/uploads/resumes" : path.resolve(__dirname, "../../uploads/resumes")
 
 const ensureUploadDirExists = () => {
   if (!fs.existsSync(uploadDir)) {
