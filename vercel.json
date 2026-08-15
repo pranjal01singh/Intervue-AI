@@ -1,4 +1,5 @@
 {
+  "name": "intervue-ai",
   "version": 2,
   "builds": [
     {
@@ -19,8 +20,16 @@
       "destination": "/backend/api/index.js"
     },
     {
+      "source": "/(assets/.*)",
+      "destination": "/frontend/$1"
+    },
+    {
+      "source": "/(.*\\..*)",
+      "destination": "/frontend/$1"
+    },
+    {
       "source": "/(.*)",
-      "destination": "/frontend/dist/$1"
+      "destination": "/frontend/index.html"
     }
   ]
 }
