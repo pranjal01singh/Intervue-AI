@@ -4,7 +4,15 @@ const cors = require("cors");
 const authRoutes = require("./routes/authRoutes");
 const interviewRoutes = require("./routes/interviewRoutes");
 
+const connectDB = require("./config/db");
 const app = express();
+
+app.use(async (req, res, next) => {
+  if (process.env.VERCEL) {
+    await connectDB().catch(console.error);
+  }
+  next();
+});
 
 app.use(
   cors({
