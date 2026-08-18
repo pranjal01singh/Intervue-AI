@@ -10,6 +10,14 @@ const modes = {
   hard: 60,
 }
 
+const VISUAL_WARNING_THRESHOLD = 45
+const VISUAL_WARNING_WARMUP_MS = 20000
+const VISUAL_WARNING_MIN_SAMPLES = 30
+const VISUAL_WARNING_WINDOW_SAMPLES = 60
+const VISUAL_WARNING_MIN_FACE_RATIO = 70
+const VISUAL_WARNING_INTERVAL_MS = 12000
+const VISUAL_AUTO_END_WARNING_LIMIT = 4
+
 const initialInstructions = [
   "Welcome to the AI mock interview.",
   "Please do not cheat or look up answers during the interview.",
@@ -35,6 +43,40 @@ const scoreAnswerConfidence = (answer = "") => {
   const words = answer.split(/\s+/).filter(Boolean).length
   const fillerCount = countFillerWords(answer)
   return Math.max(0, Math.min(100, Math.round(45 + Math.min(35, words * 1.4) - Math.min(20, fillerCount * 4))))
+}
+
+const isKnownMediaPipeConsoleNoise = (args = []) => {
+  const text = args.map((arg) => (typeof arg === "string" ? arg : arg?.message || "")).join(" ")
+  return [
+    "INFO: Created TensorFlow Lite XNNPACK delegate for CPU",
+    "Graph successfully started running",
+    "Graph finished closing successfully",
+    "Successfully destroyed WebGL context",
+    "Sets FaceBlendshapesGraph acceleration",
+    "OpenGL error checking is disabled",
+    "GL version:",
+  ].some((pattern) => text.includes(pattern))
+}
+
+const quietKnownMediaPipeLogs = () => {
+  if (typeof window === "undefined" || window.__mediapipeConsoleFilterInstalled) return
+  window.__mediapipeConsoleFilterInstalled = true
+
+  const original = {
+    error: console.error,
+    warn: console.warn,
+    log: console.log,
+  }
+
+  console.error = (...args) => {
+    if (!isKnownMediaPipeConsoleNoise(args)) original.error(...args)
+  }
+  console.warn = (...args) => {
+    if (!isKnownMediaPipeConsoleNoise(args)) original.warn(...args)
+  }
+  console.log = (...args) => {
+    if (!isKnownMediaPipeConsoleNoise(args)) original.log(...args)
+  }
 }
 
 const createEmptyVisualMetrics = () => ({
@@ -171,6 +213,7 @@ const InterviewLive = () => {
   const [isCheatDetected, setIsCheatDetected] = useState(false)
   const warningCountsRef = useRef({ eyeContact: 0, attention: 0 })
   const lastWarningTimeRef = useRef({ eyeContact: 0, attention: 0 })
+  const visualMonitoringStartedAtRef = useRef(null)
 
   const speak = (text) => {
     return new Promise((resolve) => {
@@ -196,6 +239,7 @@ const InterviewLive = () => {
 
   useEffect(() => {
     let cancelled = false
+    quietKnownMediaPipeLogs()
 
     const loadFaceLandmarker = async () => {
       try {
@@ -205,7 +249,7 @@ const InterviewLive = () => {
         faceLandmarkerRef.current = await FaceLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
-            delegate: "GPU",
+            delegate: "CPU",
           },
           outputFaceBlendshapes: false,
           outputFacialTransformationMatrixes: false,
@@ -353,16 +397,31 @@ const InterviewLive = () => {
   // Monitor metrics for warnings and cheat detection
   useEffect(() => {
     // Only start monitoring after interview has properly started
-    if (isEnded || !activeInterviewRef.current || !permissionGranted || !initialSpoken) return
+    if (isEnded || !activeInterviewRef.current || !permissionGranted || !initialSpoken || !camOn) return
     // Don't monitor until camera analytics are ready
     if (visualStatus !== "ready") return
 
     const now = Date.now()
-    const MINIMUM_WARNING_INTERVAL = 5000 // 5 seconds minimum between warnings for same metric
-    const checkAndTriggerWarning = (metric, score, threshold = 60) => {
+    if (!visualMonitoringStartedAtRef.current) {
+      visualMonitoringStartedAtRef.current = now
+      return
+    }
+
+    if (now - visualMonitoringStartedAtRef.current < VISUAL_WARNING_WARMUP_MS) return
+
+    const recentSamples = visualSamplesRef.current
+      .filter((sample) => sample.questionIndex >= 0)
+      .slice(-VISUAL_WARNING_WINDOW_SAMPLES)
+
+    if (recentSamples.length < VISUAL_WARNING_MIN_SAMPLES) return
+
+    const recentMetrics = calculateVisualSummary(recentSamples)
+    if (recentMetrics.faceDetectedRatio < VISUAL_WARNING_MIN_FACE_RATIO) return
+
+    const checkAndTriggerWarning = (metric, score, threshold = VISUAL_WARNING_THRESHOLD) => {
       if (score < threshold) {
         // Only show warning if enough time has passed since last warning for this metric
-        if (now - lastWarningTimeRef.current[metric] > MINIMUM_WARNING_INTERVAL) {
+        if (now - lastWarningTimeRef.current[metric] > VISUAL_WARNING_INTERVAL_MS) {
           lastWarningTimeRef.current[metric] = now
           warningCountsRef.current[metric] += 1
           setWarningCounts({ ...warningCountsRef.current })
@@ -375,8 +434,8 @@ const InterviewLive = () => {
           
           // Check if both metrics have reached 3 violations each
           if (
-            warningCountsRef.current.eyeContact >= 3 &&
-            warningCountsRef.current.attention >= 3
+            warningCountsRef.current.eyeContact >= VISUAL_AUTO_END_WARNING_LIMIT &&
+            warningCountsRef.current.attention >= VISUAL_AUTO_END_WARNING_LIMIT
           ) {
             setIsCheatDetected(true)
             // Auto-end interview after a short delay
@@ -389,19 +448,19 @@ const InterviewLive = () => {
     }
 
     // Check eye contact (0-100 scale)
-    const eyeContactScore = visualMetrics?.eyeContactScore
+    const eyeContactScore = recentMetrics?.eyeContactScore
     if (typeof eyeContactScore === "number") {
       checkAndTriggerWarning("eyeContact", eyeContactScore)
     }
 
     // Check attention (0-100 scale)
-    const attentionScore = visualMetrics?.attentionScore
+    const attentionScore = recentMetrics?.attentionScore
     if (typeof attentionScore === "number") {
       checkAndTriggerWarning("attention", attentionScore)
     }
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visualMetrics, isEnded, permissionGranted, initialSpoken, visualStatus])
+  }, [visualMetrics, isEnded, permissionGranted, initialSpoken, visualStatus, camOn])
 
   const getAnswerForQuestion = (questionIndex) =>
     transcriptsRef.current
@@ -1058,7 +1117,7 @@ const InterviewLive = () => {
 
             <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-center">
               <p className="text-sm font-semibold text-white">Cheat warning</p>
-              <p className="mt-2 text-sm text-slate-400">If the system detects repeated low attention and eye contact, your session will end and feedback will reflect that.</p>
+              <p className="mt-2 text-sm text-slate-400">If the system detects repeated very low attention and eye contact after camera analysis stabilizes, your session may end and feedback will reflect that.</p>
             </div>
           </aside>
         </div>
@@ -1096,8 +1155,8 @@ const InterviewLive = () => {
               </div>
               <div>
                 <h4 className="font-semibold text-yellow-200">Low Eye Contact</h4>
-                <p className="mt-1 text-sm text-yellow-100">Your eye contact score is below 60%. Please look more towards the camera.</p>
-                <p className="mt-2 text-xs text-yellow-200">Warnings: {warningCounts.eyeContact}/3</p>
+                <p className="mt-1 text-sm text-yellow-100">Your eye contact score is very low. Please look more towards the camera.</p>
+                <p className="mt-2 text-xs text-yellow-200">Warnings: {warningCounts.eyeContact}/{VISUAL_AUTO_END_WARNING_LIMIT}</p>
               </div>
             </div>
           </div>
@@ -1111,8 +1170,8 @@ const InterviewLive = () => {
               </div>
               <div>
                 <h4 className="font-semibold text-amber-200">Low Attention Score</h4>
-                <p className="mt-1 text-sm text-amber-100">Your attention score is below 60%. Please stay focused and avoid distractions.</p>
-                <p className="mt-2 text-xs text-amber-200">Warnings: {warningCounts.attention}/3</p>
+                <p className="mt-1 text-sm text-amber-100">Your attention score is very low. Please stay focused and avoid distractions.</p>
+                <p className="mt-2 text-xs text-amber-200">Warnings: {warningCounts.attention}/{VISUAL_AUTO_END_WARNING_LIMIT}</p>
               </div>
             </div>
           </div>
@@ -1126,7 +1185,7 @@ const InterviewLive = () => {
               </div>
               <h3 className="text-2xl font-bold text-red-100">Interview Ended</h3>
               <p className="mt-3 text-sm text-red-200">
-                Multiple warnings were detected for low Eye Contact, Attention, and Confidence scores. The interview has been automatically ended.
+                Multiple repeated warnings were detected for very low Eye Contact and Attention scores. The interview has been automatically ended.
               </p>
               <p className="mt-2 text-xs text-red-300">Your feedback will reflect this incident.</p>
               <button

@@ -36,6 +36,54 @@ const formatDuration = (seconds = 0) => {
   return `${mins} min ${secs} sec`
 }
 
+const isMeaningfulAnswer = (text = "") => {
+  const normalized = text.replace(/\s+/g, " ").trim()
+  return normalized.length >= 30 && normalized.split(/\s+/).filter(Boolean).length >= 8
+}
+
+const hasNoMeaningfulAnswers = (interview) => {
+  if (Array.isArray(interview?.answerAnalysis) && interview.answerAnalysis.length) {
+    return interview.answerAnalysis.every((item) => item?.skipped || !isMeaningfulAnswer(item?.answer || ""))
+  }
+
+  const userAnswers = (interview?.transcripts || []).filter((item) => item?.speaker === "user" && !item?.interim)
+  if (!userAnswers.length) return true
+  return userAnswers.every((item) => !isMeaningfulAnswer(item?.text || ""))
+}
+
+const hasHighNonVisualScores = (feedback = {}) => {
+  const scores = feedback.scores || {}
+  return [feedback.overallScore, scores.communication, scores.confidence, scores.technicalSkills, scores.answerDepth]
+    .some((score) => Number(score) > 0)
+}
+
+const sanitizeFeedbackForDisplay = (interview, feedback = {}) => {
+  if (!interview || !hasNoMeaningfulAnswers(interview) || !hasHighNonVisualScores(feedback)) return feedback
+
+  return {
+    ...feedback,
+    overallScore: 0,
+    scores: {
+      ...(feedback.scores || {}),
+      communication: 0,
+      confidence: 0,
+      technicalSkills: 0,
+      answerDepth: 0,
+    },
+    strengths: [{ title: "No answer evidence", text: "No meaningful spoken answers were recorded, so resume details were not used for performance scoring." }],
+    improvementAreas: [
+      { title: "Answer the questions", text: "No meaningful answers were captured. Speak a complete response for each question so the evaluator can score your interview performance." },
+      { title: "Check microphone input", text: "If you did answer, make sure browser microphone permission is enabled and your speech appears in the live transcript." },
+    ],
+    questionBreakdown: (feedback.questionBreakdown || []).map((item) => ({
+      ...item,
+      feedback: "Skipped or no meaningful answer detected.",
+      score: 0,
+      skipped: true,
+    })),
+  }
+}
+
 const InterviewFeedback = () => {
   const navigate = useNavigate()
   const location = useLocation()
@@ -50,10 +98,10 @@ const InterviewFeedback = () => {
   const params = new URLSearchParams(location.search)
   const interviewId = params.get("id")
   const interview = interviewState
-  const feedback = interview?.feedback || {}
+  const feedback = sanitizeFeedbackForDisplay(interview, interview?.feedback || {})
   const feedbackScores = feedback.scores || {}
   const overallScore = feedback.overallScore ?? 0
-  const answeredCount = interview?.answeredCount ?? 0
+  const answeredCount = hasNoMeaningfulAnswers(interview) ? 0 : interview?.answeredCount ?? 0
   const totalQuestions = interview?.questions?.length ?? 0
   const scoreCards = [
     { label: "Communication", score: feedbackScores.communication || 0, icon: "fa-solid fa-comments", color: "emerald" },
@@ -90,7 +138,12 @@ const InterviewFeedback = () => {
 
   useEffect(() => {
     if (!interviewId) return
-    if (interviewState && interviewState.feedback && Object.keys(interviewState.feedback).length > 0) return
+    if (
+      interviewState &&
+      interviewState.feedback &&
+      Object.keys(interviewState.feedback).length > 0 &&
+      !(hasNoMeaningfulAnswers(interviewState) && hasHighNonVisualScores(interviewState.feedback))
+    ) return
 
     getInterviewDetails(interviewId)
       .then((data) => {
