@@ -1,5 +1,6 @@
 const DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 const DEFAULT_OUTPUT_DIMENSIONALITY = 768
+const DEFAULT_EMBEDDING_TIMEOUT_MS = 45000
 
 const chunkText = (text = "", maxChars = 1200, overlapChars = 180) => {
   const normalized = text.replace(/\s+/g, " ").trim()
@@ -41,11 +42,12 @@ const embedText = async (text, taskType = "RETRIEVAL_DOCUMENT", retries = 3, ret
 
   const model = process.env.GEMINI_EMBEDDING_MODEL || DEFAULT_EMBEDDING_MODEL
   const outputDimensionality = Number(process.env.GEMINI_EMBEDDING_DIMENSIONS) || DEFAULT_OUTPUT_DIMENSIONALITY
+  const timeoutMs = Number(process.env.GEMINI_EMBEDDING_TIMEOUT_MS) || DEFAULT_EMBEDDING_TIMEOUT_MS
 
   for (let attempt = 0; attempt < retries; attempt += 1) {
     try {
       const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 15000) // 15 second timeout
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
 
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`, {
         method: "POST",
@@ -75,7 +77,7 @@ const embedText = async (text, taskType = "RETRIEVAL_DOCUMENT", retries = 3, ret
         // Retry on 503 (Service Unavailable) or 429 (Too Many Requests)
         if ((statusCode === 503 || statusCode === 429) && attempt < retries - 1) {
           const delayMs = retryDelay * Math.pow(2, attempt)
-          console.warn(`Gemini embedding error ${statusCode}. Retrying in ${delayMs}ms (attempt ${attempt + 1}/${retries})`)
+          console.warn(`Gemini embedding returned ${statusCode}. Retrying in ${delayMs}ms (attempt ${attempt + 1}/${retries})`)
           await new Promise((resolve) => setTimeout(resolve, delayMs))
           continue
         }
@@ -93,7 +95,7 @@ const embedText = async (text, taskType = "RETRIEVAL_DOCUMENT", retries = 3, ret
       
       // For other errors, retry with delay
       const delayMs = retryDelay * Math.pow(2, attempt)
-      console.warn(`Gemini embedding error: ${error.message}. Retrying in ${delayMs}ms (attempt ${attempt + 1}/${retries})`)
+      console.warn(`Gemini embedding attempt failed: ${error.message}. Retrying in ${delayMs}ms (attempt ${attempt + 1}/${retries})`)
       await new Promise((resolve) => setTimeout(resolve, delayMs))
     }
   }
@@ -110,16 +112,26 @@ const createResumeEmbeddings = async (rawText = "") => {
   }
 
   const embeddedChunks = []
+  let failedEmbeddings = 0
 
   for (let index = 0; index < chunks.length; index += 1) {
-    const embedding = await embedText(chunks[index], "RETRIEVAL_DOCUMENT")
+    let embedding = null
+    try {
+      embedding = await embedText(chunks[index], "RETRIEVAL_DOCUMENT")
+    } catch {
+      failedEmbeddings += 1
+    }
     embeddedChunks.push({ index, text: chunks[index], embedding: embedding || [] })
+  }
+
+  if (failedEmbeddings) {
+    console.warn(`Resume embeddings unavailable for ${failedEmbeddings}/${chunks.length} chunk(s). Continuing with text-only resume context.`)
   }
 
   return {
     chunks: embeddedChunks,
     model: process.env.GEMINI_EMBEDDING_MODEL || DEFAULT_EMBEDDING_MODEL,
-    embeddedAt: new Date(),
+    embeddedAt: failedEmbeddings === chunks.length ? null : new Date(),
   }
 }
 
@@ -133,7 +145,12 @@ const findRelevantResumeChunks = async ({ resumeEmbeddings, query, limit = 5 }) 
     return chunks.slice(0, limit).map((chunk) => chunk.text)
   }
 
-  const queryEmbedding = await embedText(query, "RETRIEVAL_QUERY")
+  let queryEmbedding = null
+  try {
+    queryEmbedding = await embedText(query, "RETRIEVAL_QUERY")
+  } catch {
+    console.warn("Resume query embedding unavailable. Using text-order resume context fallback.")
+  }
   if (!queryEmbedding) return chunks.slice(0, limit).map((chunk) => chunk.text)
 
   return embeddedChunks

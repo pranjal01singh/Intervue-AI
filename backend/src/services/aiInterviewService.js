@@ -447,31 +447,45 @@ const scoreAnswerConfidence = ({ answer, fillerCount, responseSeconds }) => {
   return clampScore(45 + lengthScore - fillerPenalty - delayPenalty)
 }
 
+const countWords = (text = "") => text.split(/\s+/).filter(Boolean).length
+
+const isMeaningfulAnswer = (answer = "") => {
+  const normalized = answer.replace(/\s+/g, " ").trim()
+  return normalized.length >= 30 && countWords(normalized) >= 8
+}
+
 const pairQuestionAnswers = (questions = [], transcripts = []) => {
   const pairs = []
   let currentQuestion = null
   let currentAnswer = []
   let questionStartedAt = null
 
+  if (!Array.isArray(transcripts)) return pairs
+  if (!Array.isArray(questions)) return pairs
+
   transcripts.forEach((entry) => {
+    if (!entry) return
+
     if (entry.speaker === "ai") {
       if (currentQuestion) {
-        const answer = currentAnswer.map((item) => item.text).join(" ").trim()
+        const answer = currentAnswer.map((item) => (item && item.text ? item.text : "")).join(" ").trim()
         const firstAnswerAt = currentAnswer[0]?.timestamp
         const responseSeconds = firstAnswerAt && questionStartedAt ? Math.max(0, Math.round((new Date(firstAnswerAt) - new Date(questionStartedAt)) / 1000)) : null
-        pairs.push({
-          question: currentQuestion.text || currentQuestion,
-          questionIndex: currentQuestion.questionIndex,
-          category: currentQuestion.category,
-          answer,
-          responseSeconds,
-        })
+        if (currentQuestion.text) {
+          pairs.push({
+            question: currentQuestion.text || currentQuestion,
+            questionIndex: currentQuestion.questionIndex,
+            category: currentQuestion.category || "unknown",
+            answer,
+            responseSeconds,
+          })
+        }
       }
 
       const matched =
-        typeof entry.questionIndex === "number"
+        typeof entry.questionIndex === "number" && entry.questionIndex >= 0
           ? questions[entry.questionIndex]
-          : questions.find((question) => question.text === entry.text)
+          : questions.find((question) => question && question.text === entry.text)
       if (!matched) {
         currentQuestion = null
         currentAnswer = []
@@ -491,31 +505,32 @@ const pairQuestionAnswers = (questions = [], transcripts = []) => {
     }
   })
 
-  if (currentQuestion) {
-    const answer = currentAnswer.map((item) => item.text).join(" ").trim()
+  if (currentQuestion && currentQuestion.text) {
+    const answer = currentAnswer.map((item) => (item && item.text ? item.text : "")).join(" ").trim()
     const firstAnswerAt = currentAnswer[0]?.timestamp
     const responseSeconds = firstAnswerAt && questionStartedAt ? Math.max(0, Math.round((new Date(firstAnswerAt) - new Date(questionStartedAt)) / 1000)) : null
     pairs.push({
       question: currentQuestion.text || currentQuestion,
       questionIndex: currentQuestion.questionIndex,
-      category: currentQuestion.category,
+      category: currentQuestion.category || "unknown",
       answer,
       responseSeconds,
     })
   }
 
-  return pairs.filter((pair) => pair.question).map((pair) => {
-    const fillerCount = countFillerWords(pair.answer)
-    const wordCount = pair.answer.split(/\s+/).filter(Boolean).length
+  return pairs.filter((pair) => pair && pair.question).map((pair) => {
+    if (!pair) return null
+    const fillerCount = countFillerWords(pair.answer || "")
+    const wordCount = countWords(pair.answer || "")
 
     return {
       ...pair,
       wordCount,
       fillerCount,
-      confidenceScore: scoreAnswerConfidence({ answer: pair.answer, fillerCount, responseSeconds: pair.responseSeconds }),
-      skipped: wordCount < 4,
+      confidenceScore: scoreAnswerConfidence({ answer: pair.answer || "", fillerCount, responseSeconds: pair.responseSeconds }),
+      skipped: !isMeaningfulAnswer(pair.answer || ""),
     }
-  })
+  }).filter(p => p !== null)
 }
 
 const summarizeLiveMetrics = (pairs = []) => {
@@ -534,7 +549,7 @@ const summarizeLiveMetrics = (pairs = []) => {
 
 const fallbackFeedback = ({ questions, transcripts, domain, visualMetrics, isCheat = false }) => {
   const pairs = pairQuestionAnswers(questions, transcripts)
-  const answered = pairs.filter((pair) => pair.answer && pair.answer.length > 15)
+  const answered = pairs.filter((pair) => !pair.skipped)
   const answeredCount = answered.length
   const avgAnswerLength = answeredCount ? answered.reduce((sum, pair) => sum + pair.answer.length, 0) / answeredCount : 0
   const liveMetrics = summarizeLiveMetrics(pairs)
@@ -548,11 +563,11 @@ const fallbackFeedback = ({ questions, transcripts, domain, visualMetrics, isChe
     confidence = 12
     answerDepth = 8
   } else if (answeredCount === 0) {
-    // No answers provided - significantly lower scores
-    communication = 20
-    technical = 15
-    confidence = clampScore(typeof liveMetrics?.confidence === "number" ? Math.min(liveMetrics.confidence, 18) : 15)
-    answerDepth = 12
+    // No meaningful answers means no interview-performance credit.
+    communication = 0
+    technical = 0
+    confidence = 0
+    answerDepth = 0
   } else {
     // Normal scoring for answered questions
     communication = clampScore(avgAnswerLength > 250 ? 78 : avgAnswerLength > 120 ? 68 : 52)
@@ -571,10 +586,14 @@ const fallbackFeedback = ({ questions, transcripts, domain, visualMetrics, isChe
   const attention = clampScore(visualMetrics?.attentionScore || 0)
   const visualScores = [eyeContact, attention].filter((score) => score > 0)
   const scoreCount = visualScores.length > 0 ? 6 : 4
-  const overall = clampScore((communication + technical + confidence + answerDepth + visualScores.reduce((sum, value) => sum + value, 0)) / scoreCount)
+  const overall = answeredCount === 0 && !isCheat
+    ? 0
+    : clampScore((communication + technical + confidence + answerDepth + visualScores.reduce((sum, value) => sum + value, 0)) / scoreCount)
 
   const strengths = isCheat
-    ? [{ title: "Note", text: "This interview was ended due to suspicious activity detected during the session (multiple warnings for Eye Contact, Attention, and Confidence below 60%)." }]
+    ? [{ title: "Note", text: "This interview was ended after repeated very low eye-contact and attention warnings during the session." }]
+    : answeredCount === 0
+      ? [{ title: "No answer evidence", text: "No meaningful spoken answers were recorded, so resume details were not used for performance scoring." }]
     : [
         { title: "Resume alignment", text: `You connected your answers with your ${domain || "target"} profile.` },
         ...(answeredCount > 0
@@ -589,6 +608,11 @@ const fallbackFeedback = ({ questions, transcripts, domain, visualMetrics, isChe
         { title: "Speak clearly", text: "Ensure your microphone is working and speak loud enough to be recorded." },
         { title: "Be honest", text: "Answer questions genuinely to get accurate feedback on your performance." },
       ]
+    : answeredCount === 0
+      ? [
+          { title: "Answer the questions", text: "No meaningful answers were captured. Speak a complete response for each question so the evaluator can score your communication, confidence, technical skill, and answer depth." },
+          { title: "Check microphone input", text: "If you did answer, make sure the browser has microphone permission and your speech is visible in the live transcript." },
+        ]
     : [
         { title: "Add more depth", text: "Use Situation, Task, Action, Result structure and include exact tech decisions." },
         { title: "Be more specific", text: "Mention metrics, tradeoffs, edge cases, and production impact where possible." },
@@ -609,57 +633,110 @@ const fallbackFeedback = ({ questions, transcripts, domain, visualMetrics, isChe
     improvementAreas,
     questionBreakdown: pairs.map((pair) => ({
       question: pair.question,
-      feedback: pair.answer ? "Answer recorded. Add examples, tradeoffs, and measurable impact to make it stronger." : "Skipped or no clear answer detected.",
-      score: pair.answer ? clampScore((pair.confidenceScore + Math.min(85, 45 + pair.answer.length / 12)) / 2) : 0,
-      skipped: !pair.answer,
+      feedback: pair.skipped ? "Skipped or no meaningful answer detected." : "Answer recorded. Add examples, tradeoffs, and measurable impact to make it stronger.",
+      score: pair.skipped ? 0 : clampScore((pair.confidenceScore + Math.min(85, 45 + pair.answer.length / 12)) / 2),
+      skipped: pair.skipped,
     })),
     isCheat,
     source: "fallback",
   }
 }
 
-const buildFeedbackPrompt = ({ interview, transcripts }) => [
-  {
-    role: "developer",
-    content: [
-      {
-        type: "input_text",
-        text: "You are an interview evaluator. Return only valid JSON. Be fair, specific, and actionable. Evaluate confidence from answer clarity, directness, filler-like uncertainty, and completeness; do not claim visual eye-contact unless video analytics is provided.",
+const buildFeedbackPrompt = ({ interview, transcripts }) => {
+  try {
+    const answerAnalysis = Array.isArray(interview?.answerAnalysis)
+      ? interview.answerAnalysis
+      : pairQuestionAnswers(interview?.questions || [], transcripts || [])
+    const meaningfulAnswers = answerAnalysis.filter((item) => !item.skipped)
+    const promptData = {
+      task: "Evaluate mock interview answers using only the recorded user answers.",
+      rules: [
+        "Do not score from resume/profile/projects/skills. Resume context may explain the target role only, not performance.",
+        "Communication, confidence, technicalSkills, and answerDepth must be based only on userAnswer text.",
+        "If meaningfulAnswerCount is 0, overallScore and all non-visual scores must be 0.",
+        "For any skipped question, questionBreakdown score must be 0 and skipped must be true.",
+        "Do not invent answers or infer knowledge from the question text.",
+      ],
+      outputShape: {
+        overallScore: 0,
+        scores: { communication: 0, confidence: 0, technicalSkills: 0, answerDepth: 0, eyeContact: 0, attention: 0 },
+        strengths: [{ title: "", text: "" }],
+        improvementAreas: [{ title: "", text: "" }],
+        questionBreakdown: [{ question: "", feedback: "", score: 0, skipped: false }],
       },
-    ],
-  },
-  {
-    role: "user",
-    content: [
-      {
-        type: "input_text",
-        text: JSON.stringify({
-          task: "Evaluate mock interview answers",
-          outputShape: {
-            overallScore: 0,
-            scores: { communication: 0, confidence: 0, technicalSkills: 0, answerDepth: 0, eyeContact: 0, attention: 0 },
-            strengths: [{ title: "", text: "" }],
-            improvementAreas: [{ title: "", text: "" }],
-            questionBreakdown: [{ question: "", feedback: "", score: 0, skipped: false }],
-          },
-          interview: {
-            domain: interview.detectedDomain,
-            mode: interview.mode,
-            trackTitle: interview.trackTitle,
-            questions: interview.questions,
-            resumeParsedData: interview.resumeParsedData,
-            answerAnalysis: interview.answerAnalysis || [],
-            liveMetrics: interview.liveMetrics || {},
-            visualMetrics: interview.visualMetrics || {},
-          },
-          transcripts,
-        }),
+      interview: {
+        domain: interview?.detectedDomain || "",
+        mode: interview?.mode || "",
+        trackTitle: interview?.trackTitle || "",
+        meaningfulAnswerCount: meaningfulAnswers.length,
+        answerAnalysis: answerAnalysis.map((item) => ({
+          question: item?.question || "",
+          questionIndex: item?.questionIndex,
+          category: item?.category || "",
+          userAnswer: item?.answer || "",
+          wordCount: item?.wordCount || 0,
+          skipped: !!item?.skipped,
+        })),
+        liveMetrics: interview?.liveMetrics || {},
+        visualMetrics: interview?.visualMetrics || {},
       },
-    ],
-  },
-]
+    }
+    
+    return [
+      {
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text: "You are an interview evaluator. Return only valid JSON. Score only the candidate's recorded answers. Never give performance credit from resume data, profile data, question wording, or target role. If an answer is skipped or empty, score that question 0.",
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: JSON.stringify(promptData),
+          },
+        ],
+      },
+    ]
+  } catch (error) {
+    console.error("Error building feedback prompt:", error.message)
+    return [
+      {
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text: "You are an interview evaluator. Return only valid JSON.",
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: JSON.stringify({ task: "Evaluate interview", domain: "Unknown", questions: [], answerAnalysis: [] }),
+          },
+        ],
+      },
+    ]
+  }
+}
 
 const normalizeFeedback = (feedback, fallback) => {
+  const hasNoMeaningfulAnswers = (fallback?.questionBreakdown || []).every((item) => item.skipped || !item.score)
+
+  if (hasNoMeaningfulAnswers) {
+    return {
+      ...fallback,
+      source: feedback?.source || fallback.source || "gemini-guarded",
+    }
+  }
+
   const useFallbackForEmptyScore = (score, fallbackScore) => {
     const normalized = clampScore(score)
     const normalizedFallback = clampScore(fallbackScore)
@@ -687,12 +764,35 @@ const normalizeFeedback = (feedback, fallback) => {
     overallScore = clampScore(sum / scoreCount)
   }
 
+  const fallbackBreakdown = fallback.questionBreakdown || []
+  const normalizedBreakdown = fallbackBreakdown.map((fallbackItem, index) => {
+    const aiItem = Array.isArray(feedback?.questionBreakdown) ? feedback.questionBreakdown[index] : null
+    if (fallbackItem.skipped) {
+      return {
+        ...fallbackItem,
+        feedback: aiItem?.feedback && /skip|no answer|not answered|empty/i.test(aiItem.feedback)
+          ? aiItem.feedback
+          : fallbackItem.feedback,
+        score: 0,
+        skipped: true,
+      }
+    }
+
+    return {
+      ...fallbackItem,
+      ...(aiItem && typeof aiItem === "object" ? aiItem : {}),
+      question: fallbackItem.question,
+      score: clampScore(aiItem?.score ?? fallbackItem.score),
+      skipped: false,
+    }
+  })
+
   return {
     overallScore,
     scores: normalizedScores,
     strengths: Array.isArray(feedback?.strengths) && feedback.strengths.length ? feedback.strengths.slice(0, 5) : fallback.strengths,
     improvementAreas: Array.isArray(feedback?.improvementAreas) && feedback.improvementAreas.length ? feedback.improvementAreas.slice(0, 5) : fallback.improvementAreas,
-    questionBreakdown: Array.isArray(feedback?.questionBreakdown) && feedback.questionBreakdown.length ? feedback.questionBreakdown : fallback.questionBreakdown,
+    questionBreakdown: normalizedBreakdown.length ? normalizedBreakdown : fallback.questionBreakdown,
     isCheat: feedback?.isCheat ?? fallback.isCheat ?? false,
     source: feedback?.source || "gemini",
   }

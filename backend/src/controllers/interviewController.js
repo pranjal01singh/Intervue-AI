@@ -187,55 +187,63 @@ const completeInterview = async (req, res, next) => {
       return res.status(404).json({ success: false, message: "Interview not found" })
     }
 
-    interview.status = "completed"
-    interview.completedAt = new Date()
-    if (typeof durationSeconds === "number") interview.durationSeconds = durationSeconds
-    if (Array.isArray(transcripts)) {
-      interview.transcripts = transcripts.map((t) => ({
-        speaker: t.speaker,
-        text: t.text,
-        timestamp: t.timestamp ? new Date(t.timestamp) : new Date(),
-        questionIndex: typeof t.questionIndex === "number" ? t.questionIndex : undefined,
-        questionText: t.questionText,
-        interim: !!t.interim,
-      }))
-    }
-
-    const answerAnalysis = pairQuestionAnswers(interview.questions, interview.transcripts)
-    interview.answerAnalysis = answerAnalysis
-    interview.liveMetrics = summarizeLiveMetrics(answerAnalysis)
-    
-    // Recalculate answeredCount from transcripts to ensure accuracy
-    const answeredQuestions = answerAnalysis.filter((pair) => !pair.skipped).length
-    interview.answeredCount = answeredQuestions || (typeof answeredCount === "number" ? answeredCount : 0)
-    
-    if (visualMetrics && typeof visualMetrics === "object") {
-      interview.visualMetrics = {
-        eyeContactScore: visualMetrics.eyeContactScore,
-        attentionScore: visualMetrics.attentionScore,
-        faceDetectedRatio: visualMetrics.faceDetectedRatio,
-        lookingAwayCount: visualMetrics.lookingAwayCount,
-        totalSamples: visualMetrics.totalSamples,
-        questionMetrics: Array.isArray(visualMetrics.questionMetrics) ? visualMetrics.questionMetrics : [],
+    try {
+      interview.status = "completed"
+      interview.completedAt = new Date()
+      if (typeof durationSeconds === "number") interview.durationSeconds = durationSeconds
+      if (Array.isArray(transcripts)) {
+        interview.transcripts = transcripts.map((t) => ({
+          speaker: t.speaker || "",
+          text: t.text || "",
+          timestamp: t.timestamp ? new Date(t.timestamp) : new Date(),
+          questionIndex: typeof t.questionIndex === "number" ? t.questionIndex : undefined,
+          questionText: t.questionText || "",
+          interim: !!t.interim,
+        }))
+      } else {
+        interview.transcripts = []
       }
+
+      const answerAnalysis = pairQuestionAnswers(interview.questions || [], interview.transcripts || [])
+      interview.answerAnalysis = answerAnalysis
+      interview.liveMetrics = summarizeLiveMetrics(answerAnalysis)
+      
+      // Recalculate answeredCount from transcripts to ensure accuracy
+      const answeredQuestions = answerAnalysis.filter((pair) => !pair.skipped).length
+      interview.answeredCount = answeredQuestions
+      
+      if (visualMetrics && typeof visualMetrics === "object") {
+        interview.visualMetrics = {
+          eyeContactScore: visualMetrics.eyeContactScore || 0,
+          attentionScore: visualMetrics.attentionScore || 0,
+          faceDetectedRatio: visualMetrics.faceDetectedRatio || 0,
+          lookingAwayCount: visualMetrics.lookingAwayCount || 0,
+          totalSamples: visualMetrics.totalSamples || 0,
+          questionMetrics: Array.isArray(visualMetrics.questionMetrics) ? visualMetrics.questionMetrics : [],
+        }
+      }
+
+      await interview.save()
+
+      const feedback = await evaluateInterview({
+        interview,
+        transcripts: interview.transcripts || [],
+        isCheat: !!isCheat,
+      })
+      interview.feedback = {
+        ...feedback,
+        generatedAt: new Date(),
+      }
+
+      await interview.save()
+
+      res.status(200).json({ success: true, message: "Interview completed", interview })
+    } catch (analysisError) {
+      console.error("Error during interview analysis:", analysisError.message, analysisError.stack)
+      throw analysisError
     }
-
-    await interview.save()
-
-    const feedback = await evaluateInterview({
-      interview,
-      transcripts: interview.transcripts,
-      isCheat: !!isCheat,
-    })
-    interview.feedback = {
-      ...feedback,
-      generatedAt: new Date(),
-    }
-
-    await interview.save()
-
-    res.status(200).json({ success: true, message: "Interview completed", interview })
   } catch (error) {
+    console.error("Interview completion error:", error.message, error.stack)
     next(error)
   }
 }
@@ -256,31 +264,44 @@ const hasEmptyFeedbackScores = (feedback) => {
   return scores.every((score) => !score || Number(score) === 0)
 }
 
+const hasHighFeedbackWithoutAnswers = (interview) => {
+  const answerAnalysis = pairQuestionAnswers(interview.questions || [], interview.transcripts || [])
+  const answeredQuestions = answerAnalysis.filter((pair) => !pair.skipped).length
+  if (answeredQuestions > 0) return false
+
+  const scores = interview.feedback?.scores || {}
+  return [interview.feedback?.overallScore, scores.communication, scores.confidence, scores.technicalSkills, scores.answerDepth]
+    .some((score) => Number(score) > 0)
+}
+
 const repairInterviewFeedbackIfNeeded = async (interview) => {
-  if (interview.status !== "completed" && !interview.completedAt && !interview.feedback?.generatedAt) return interview
-  if (!hasEmptyFeedbackScores(interview.feedback)) return interview
+  if (interview?.status !== "completed" || !interview?.completedAt || !interview?.feedback) return interview
+  if (!hasEmptyFeedbackScores(interview.feedback) && !hasHighFeedbackWithoutAnswers(interview)) return interview
 
-  const answerAnalysis = pairQuestionAnswers(interview.questions, interview.transcripts)
-  interview.answerAnalysis = answerAnalysis
-  interview.liveMetrics = summarizeLiveMetrics(answerAnalysis)
-  interview.answeredCount = answerAnalysis.filter((pair) => !pair.skipped).length || interview.answeredCount || 0
-  interview.status = "completed"
-  if (!interview.completedAt) interview.completedAt = new Date()
+  try {
+    const answerAnalysis = pairQuestionAnswers(interview.questions || [], interview.transcripts || [])
+    interview.answerAnalysis = answerAnalysis
+    interview.liveMetrics = summarizeLiveMetrics(answerAnalysis)
+    interview.answeredCount = answerAnalysis.filter((pair) => !pair.skipped).length
+    interview.status = "completed"
+    if (!interview.completedAt) interview.completedAt = new Date()
 
-  const feedback = await evaluateInterview({
-    interview,
-    transcripts: interview.transcripts,
-    isCheat: !!interview.feedback?.isCheat,
-  })
-  interview.feedback = {
-    ...feedback,
-    generatedAt: new Date(),
+    const feedback = await evaluateInterview({
+      interview,
+      transcripts: interview.transcripts || [],
+      isCheat: !!interview.feedback?.isCheat,
+    })
+    interview.feedback = {
+      ...feedback,
+      generatedAt: new Date(),
+    }
+    await interview.save()
+  } catch (error) {
+    console.error("Error repairing interview feedback:", error.message)
   }
-  await interview.save()
 
   return interview
 }
-
 const getInterviewById = async (req, res, next) => {
   try {
     const interview = await Interview.findOne({ _id: req.params.id, user: req.user._id })
@@ -320,8 +341,9 @@ const getDerivedAnsweredCount = (interview) => {
   if (Array.isArray(interview.transcripts) && interview.transcripts.length) {
     const answeredQuestions = new Set()
     interview.transcripts.forEach((item) => {
-      const wordCount = typeof item.text === "string" ? item.text.trim().split(/\s+/).filter(Boolean).length : 0
-      if (item.speaker === "user" && !item.interim && typeof item.questionIndex === "number" && wordCount >= 4) {
+      const normalized = typeof item.text === "string" ? item.text.replace(/\s+/g, " ").trim() : ""
+      const wordCount = normalized.split(/\s+/).filter(Boolean).length
+      if (item.speaker === "user" && !item.interim && typeof item.questionIndex === "number" && normalized.length >= 30 && wordCount >= 8) {
         answeredQuestions.add(item.questionIndex)
       }
     })
